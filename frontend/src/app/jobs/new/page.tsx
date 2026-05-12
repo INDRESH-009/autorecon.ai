@@ -47,7 +47,7 @@ export default function NewJobPage() {
       const fd = new FormData();
       fd.append("file", file);
       // Default header_row=1 (0-indexed) matches vendor_soa_quicklogi.xlsx
-      await api.postForm(`/api/jobs/${job.id}/soa?header_row=1`, fd);
+      await api.postForm(`/api/jobs/${job.id}/soa`, fd);
       router.push(`/jobs/${job.id}`);
     } catch (e: any) {
       setErr(e.message || String(e));

@@ -10,6 +10,7 @@ from app.db import models
 from app.db.session import get_db
 from app.extraction import extract_file, list_sheets
 from app.mapping.apply import apply_mapping
+from app.mapping.dictionary import ALIASES
 from app.mapping.resolver import header_signature, suggest_mapping
 from app.recon.runner import run_job
 from app.schemas import (
@@ -21,6 +22,39 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+def _detect_header_row(path, sheet_name, max_scan: int = 5) -> int:
+    """Auto-detect which row in the SOA holds the column headers.
+
+    Scans the first `max_scan` rows, treats each as a candidate header row,
+    and scores it by how many of its cells look like canonical field aliases
+    (invoice number / date / amount synonyms). The row with the most hits
+    wins. Falls back to 0 if no row stands out.
+
+    Real-world SOAs vary: clean 3-column files have headers on row 1
+    (header_row=0); AP-team templates with sub-total preambles have them on
+    row 2 (header_row=1). This makes the upload robust to both.
+    """
+    all_aliases = {a.lower() for v in ALIASES.values() for a in v}
+    best_row, best_hits = 0, 0
+    for hr in range(max_scan):
+        try:
+            t = extract_file(path, sheet_name=sheet_name, header_row=hr)
+        except Exception:
+            continue
+        hits = 0
+        for h in t.headers:
+            if not isinstance(h, str):
+                continue
+            hl = h.strip().lower()
+            if not hl:
+                continue
+            if any(a in hl or hl in a for a in all_aliases):
+                hits += 1
+        if hits > best_hits:
+            best_hits, best_row = hits, hr
+    return best_row
 
 
 @router.get("", response_model=list[ReconJobBrief])
@@ -77,14 +111,17 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
 def upload_soa(
     job_id: int,
     sheet: str | None = None,
-    header_row: int = 1,  # vendor_soa_quicklogi has header on row 2 (1-indexed -> header_row=1 zero-indexed)
+    header_row: int | None = None,  # None → auto-detect; explicit int → use as-is
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> MappingSuggestOut:
     """Upload the vendor's SOA, auto-detect column mapping, return suggestion.
 
-    The accountant can override `sheet` and `header_row` in the UI; defaults
-    match the canonical vendor_soa_quicklogi shape (sheet=0, header_row=1).
+    `header_row` semantics:
+      - omitted/None: scan the first few rows and pick the one whose cells
+        look most like canonical field names (handles clean 3-col SOAs AND
+        AP-team templates with sub-total preambles automatically).
+      - explicit int: use that row index verbatim (accountant override).
     """
     job = db.query(models.ReconJob).get(job_id)
     if not job:
@@ -100,6 +137,10 @@ def upload_soa(
     # Resolve sheet
     sheets = list_sheets(dest)
     chosen_sheet = sheet if sheet in sheets else (sheets[0] if sheets else None)
+
+    # Auto-detect header row if not explicitly provided
+    if header_row is None:
+        header_row = _detect_header_row(dest, chosen_sheet)
 
     try:
         table = extract_file(dest, sheet_name=chosen_sheet, header_row=header_row)
@@ -169,7 +210,7 @@ def confirm_mapping(job_id: int, body: ConfirmMappingIn, db: Session = Depends(g
     # Re-extract from disk to get full rows (we only stored preview)
     soa_meta = job.soa.mapping or {}
     chosen_sheet = soa_meta.get("_sheet")
-    header_row = soa_meta.get("_header_row", 1)
+    header_row = soa_meta.get("_header_row", 0)
     try:
         table = extract_file(job.soa.storage_path, sheet_name=chosen_sheet, header_row=header_row)
     except Exception as e:
